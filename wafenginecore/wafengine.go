@@ -958,7 +958,47 @@ func (waf *WafEngine) errorResponse() func(http.ResponseWriter, *http.Request, e
 				)
 			}
 
-			resBytes := []byte("<html><head><title>服务不可用</title></head><body><center><h1>服务不可用</h1> <br><h3></h3></center></body> </html>")
+			// 【关键修复】当检测到后端连接错误时，清理对应的Transport缓存
+			// 防止后端下线后重新上线时复用失效的连接池，导致协议状态混乱
+			if !isClient && wafHttpContext.HostCode != "" {
+				host := waf.rt().HostCode[wafHttpContext.HostCode]
+				if hostTarget, exists := waf.rt().HostTarget[host]; exists {
+					// 生成Transport的key并清理
+					transportKey := waf.generateTransportKey(host, 0, model.LoadBalance{}, hostTarget)
+					waf.TransportMux.Lock()
+					if transport, txExists := waf.TransportPool[transportKey]; txExists {
+						transport.CloseIdleConnections()
+						delete(waf.TransportPool, transportKey)
+						zlog.Info("清理失效的Transport连接池",
+							zap.String("host", host),
+							zap.String("transport_key", transportKey),
+							zap.String("error_category", category))
+					}
+					waf.TransportMux.Unlock()
+
+					// 如果启用了负载均衡，也需要清理负载均衡的Transport
+					if hostTarget.Host.IsEnableLoadBalance > 0 {
+						for _, lb := range hostTarget.LoadBalanceLists {
+							lbKey := waf.generateTransportKey(host, 1, lb, hostTarget)
+							waf.TransportMux.Lock()
+							if lbTransport, lbExists := waf.TransportPool[lbKey]; lbExists {
+								lbTransport.CloseIdleConnections()
+								delete(waf.TransportPool, lbKey)
+								zlog.Info("清理负载均衡的Transport连接池",
+									zap.String("host", host),
+									zap.String("transport_key", lbKey),
+									zap.String("backend_ip", lb.Remote_ip),
+									zap.Int("backend_port", lb.Remote_port))
+							}
+							waf.TransportMux.Unlock()
+						}
+					}
+				}
+			}
+
+			// 返回统一的错误响应页面（不区分错误类型，不暴露后端细节）
+			var resBytes []byte
+			resBytes = []byte("<html><head><title>服务不可用</title></head><body><center><h1>服务不可用</h1> <br><h3></h3></center></body> </html>")
 
 			//记录响应Header信息
 			resHeader := ""
